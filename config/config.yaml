@@ -1,0 +1,27 @@
+# 配置文件
+# 应用配置
+
+app:
+  name: Financial_RAG_Agent
+  version: "0.1.0"
+
+# 模型配置
+llm:
+  provider: openai
+  model: gpt-4
+  temperature: 0.7
+
+# 向量数据库配置
+vector_db:
+  provider: qdrant
+  host: localhost
+  port: 6333
+  collection_name: financial_documents
+
+# 数据处理配置
+data:
+  raw_dir: data/raw
+  vector_db_dir: data/vector_db
+  chunk_size: 1000
+  chunk_overlap: 200
+

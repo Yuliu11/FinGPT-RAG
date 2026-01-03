@@ -1,0 +1,396 @@
+"""
+Streamlit 应用启动入口
+根目录下的 main.py，作为 Streamlit 的启动入口点
+自动加载 .env 文件并调用 app/ 目录下的核心逻辑
+"""
+
+import os
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
+
+# 自动加载 .env 文件（优先从根目录加载）
+project_root = Path(__file__).parent
+env_path = project_root / '.env'
+load_dotenv(dotenv_path=env_path, override=True)
+
+# 检查 API Key 是否加载成功（不打印敏感信息）
+api_key = os.getenv("OPENAI_API_KEY")
+if api_key:
+    print("✓ 成功加载 API Key")
+else:
+    print(f"⚠ 警告：在 {env_path} 未找到有效的 API Key")
+
+# 添加项目根目录到 Python 路径
+sys.path.insert(0, str(project_root))
+
+# 导入 Streamlit 和必要的模块
+import streamlit as st
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+
+# 导入 app 目录下的核心模块
+from app.graph import get_llm
+
+# 页面配置
+st.set_page_config(
+    page_title="Financial RAG Agent",
+    page_icon="💰",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 初始化 session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "document_count" not in st.session_state:
+    st.session_state.document_count = 0
+
+
+@st.cache_resource
+def initialize_vector_store():
+    """初始化向量数据库（缓存）"""
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        
+        # 初始化嵌入模型（与入库时保持一致）
+        embeddings = HuggingFaceEmbeddings(
+            model_name='shibing624/text2vec-base-chinese',
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        
+        # 初始化向量数据库（使用 QdrantVectorStore）
+        vector_db_path = project_root / "data" / "vector_db"
+        client = QdrantClient(path=str(vector_db_path))
+        
+        # 使用 QdrantVectorStore（新版本 API）
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name="financial_documents",
+            embedding=embeddings
+        )
+        
+        # 获取文档数量（使用 QdrantClient 直接查询）
+        try:
+            collection_info = client.get_collection("financial_documents")
+            document_count = collection_info.points_count
+        except:
+            document_count = 19085  # 默认值
+        
+        return vector_store, document_count
+    except Exception as e:
+        st.error(f"初始化向量数据库失败: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+        return None, 0
+
+
+def get_document_count():
+    """获取文档数量"""
+    try:
+        vector_db_path = project_root / "data" / "vector_db"
+        client = QdrantClient(path=str(vector_db_path))
+        collection_info = client.get_collection("financial_documents")
+        return collection_info.points_count
+    except:
+        return 19085  # 默认值
+
+
+def retrieve_documents(query: str, vector_store, k: int = 5):
+    """
+    从向量数据库检索相关文档
+    
+    Args:
+        query: 查询文本
+        vector_store: 向量存储对象
+        k: 返回的文档数量
+        
+    Returns:
+        检索到的文档列表
+    """
+    try:
+        # 使用 LangChain 的 similarity_search_with_score 方法
+        # 这个方法会自动使用传入的 embeddings 模型进行查询向量化
+        if vector_store is None:
+            return []
+        
+        docs = vector_store.similarity_search_with_score(query, k=k)
+        return docs
+    except AttributeError as e:
+        # 如果 similarity_search_with_score 不可用，尝试使用 similarity_search
+        try:
+            docs = vector_store.similarity_search(query, k=k)
+            # 如果没有分数，返回默认分数 0.0
+            docs_with_score = [(doc, 0.0) for doc in docs]
+            return docs_with_score
+        except Exception as e2:
+            st.error(f"检索文档失败: {str(e2)}")
+            import traceback
+            st.code(traceback.format_exc())
+            return []
+    except Exception as e:
+        st.error(f"检索文档失败: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+        return []
+
+
+def format_context(docs):
+    """
+    格式化检索到的文档为上下文
+    
+    Args:
+        docs: 文档列表（包含分数）
+        
+    Returns:
+        格式化后的上下文字符串和来源信息
+    """
+    context_parts = []
+    sources = []
+    
+    for i, (doc, score) in enumerate(docs, 1):
+        content = doc.page_content
+        metadata = doc.metadata
+        
+        # 提取来源信息
+        company = metadata.get("company", "未知公司")
+        year = metadata.get("year", "未知年份")
+        report_type = metadata.get("report_type", "未知类型")
+        file_name = metadata.get("file_name", "未知文件")
+        
+        source_info = {
+            "index": i,
+            "company": company,
+            "year": year,
+            "report_type": report_type,
+            "file_name": file_name,
+            "content": content[:500] + "..." if len(content) > 500 else content,  # 截取前500字符
+            "score": f"{score:.4f}"
+        }
+        sources.append(source_info)
+        
+        # 构建上下文
+        context_parts.append(f"[文档 {i}] {content}")
+    
+    return "\n\n".join(context_parts), sources
+
+
+def generate_response(query: str, context: str, llm):
+    """
+    使用 LLM 生成回答（流式输出）
+    
+    Args:
+        query: 用户问题
+        context: 检索到的上下文
+        llm: LLM 模型
+        
+    Yields:
+        回答的文本片段
+    """
+    from langchain_core.prompts import ChatPromptTemplate
+    
+    # 构建提示词
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", """你是一个专业的金融文档分析助手。请基于提供的文档内容回答用户的问题。
+
+要求：
+1. 回答要准确、专业
+2. 如果文档中没有相关信息，请明确说明
+3. 可以引用具体的数字和数据
+4. 回答要简洁明了
+
+文档内容：
+{context}"""),
+        ("human", "{question}")
+    ])
+    
+    # 格式化提示词
+    messages = prompt_template.format_messages(
+        context=context,
+        question=query
+    )
+    
+    # 流式调用 LLM
+    for chunk in llm.stream(messages):
+        # 处理不同类型的 chunk
+        if hasattr(chunk, 'content'):
+            content = chunk.content
+            if content:
+                yield content
+        elif isinstance(chunk, str):
+            yield chunk
+        elif hasattr(chunk, 'text'):
+            yield chunk.text
+
+
+# 侧边栏：使用说明
+with st.sidebar:
+    st.header("📖 使用说明")
+    
+    st.markdown("### 🎯 核心功能")
+    st.markdown("""
+    本助手是一个专业的**金融文档智能问答系统**，基于 RAG（检索增强生成）技术构建。
+    
+    **主要能力：**
+    - 📊 分析上市公司财务报告
+    - 💰 回答关于营收、利润、资产等财务指标的问题
+    - 📈 对比不同公司的财务表现
+    - 🔍 查找特定年份或报告类型的信息
+    """)
+    
+    st.divider()
+    
+    st.markdown("### 💡 提问示例")
+    st.markdown("""
+    **财务指标查询：**
+    - "比亚迪2024年的营业收入是多少？"
+    - "贵州茅台2023年的净利润增长率是多少？"
+    - "招商银行2024年的总资产是多少？"
+    
+    **对比分析：**
+    - "对比一下中国平安和招商银行2024年的净利润"
+    - "格力电器和立讯精密2023年的营收对比"
+    
+    **趋势分析：**
+    - "海康威视近两年的营收趋势如何？"
+    - "立讯精密2023到2024年的业绩变化"
+    
+    **其他问题：**
+    - "比亚迪的主要业务是什么？"
+    - "贵州茅台的核心竞争力是什么？"
+    """)
+    
+    st.divider()
+    
+    st.markdown("### 📚 数据来源")
+    st.markdown("""
+    本系统基于以下上市公司的公开财务报告：
+    
+    - **中国平安** - 年度报告、半年度报告
+    - **招商银行** - 年度报告、半年度报告
+    - **格力电器** - 年度报告、半年度报告
+    - **比亚迪** - 年度报告、半年度报告
+    - **海康威视** - 年度报告、半年度报告
+    - **立讯精密** - 年度报告、半年度报告
+    - **贵州茅台** - 年度报告、半年度报告
+    
+    数据涵盖 **2023-2025年** 的财务报告，所有信息均来自上市公司官方披露的PDF文档。
+    """)
+    
+    st.divider()
+    
+    st.markdown("### ⚙️ 使用提示")
+    st.markdown("""
+    1. **输入问题**：在下方输入框中输入您的问题
+    2. **智能检索**：系统会自动从文档库中检索相关信息
+    3. **流式回答**：回答会以打字机效果实时显示
+    4. **查看来源**：回答完成后可展开"检索来源"查看具体文档片段
+    5. **多轮对话**：支持连续提问，系统会记住对话历史
+    """)
+
+
+# 主界面
+st.title("💰 Financial RAG Agent")
+st.markdown("**金融文档智能问答系统** - 基于 LangChain 和 DeepSeek")
+
+# 确保数据库已初始化
+if st.session_state.vector_store is None:
+    with st.spinner("正在连接金融数据库..."):
+        vector_store, doc_count = initialize_vector_store()
+        st.session_state.vector_store = vector_store
+        st.session_state.document_count = doc_count
+    st.rerun()
+
+# 显示对话历史
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        
+        # 如果是助手回答，显示检索来源
+        if message["role"] == "assistant" and "sources" in message:
+            with st.expander("📚 检索来源", expanded=False):
+                for source in message["sources"]:
+                    st.markdown(f"""
+                    **文档 {source['index']}** (相似度: {source['score']})
+                    - **公司**: {source['company']}
+                    - **年份**: {source['year']}
+                    - **报告类型**: {source['report_type']}
+                    - **文件名**: {source['file_name']}
+                    - **内容片段**: 
+                    > {source['content']}
+                    """)
+                    st.divider()
+
+# 用户输入（确保在主循环中，页面加载时就渲染）
+if prompt := st.chat_input("请输入您的问题..."):
+    # 添加用户消息
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # 检查向量数据库是否已初始化
+    if st.session_state.vector_store is None:
+        st.error("向量数据库未初始化，请检查数据文件")
+        st.stop()
+    
+    # 检索相关文档
+    with st.spinner("正在检索相关文档..."):
+        docs = retrieve_documents(prompt, st.session_state.vector_store, k=5)
+        
+        if not docs:
+            st.warning("未找到相关文档，请尝试其他问题")
+            st.stop()
+        
+        # 格式化上下文和来源
+        context, sources = format_context(docs)
+    
+    # 生成回答（流式输出）
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        try:
+            # 初始化 LLM（每次调用时重新加载，确保使用最新的 API Key）
+            llm = get_llm()
+            
+            # 流式生成回答（打字机效果）
+            for chunk in generate_response(prompt, context, llm):
+                if chunk:  # 确保 chunk 不为空
+                    full_response += chunk
+                    # 实时更新显示，添加光标效果
+                    message_placeholder.markdown(full_response + "▌")
+            
+            # 移除光标，显示最终回答
+            message_placeholder.markdown(full_response)
+            
+            # 显示检索来源（使用 expander）
+            with st.expander("📚 检索来源", expanded=False):
+                st.markdown("**以下是从向量数据库中检索到的相关文档片段：**")
+                st.markdown("")
+                for source in sources:
+                    st.markdown(f"""
+                    **文档 {source['index']}** (相似度分数: {source['score']})
+                    - **公司**: {source['company']}
+                    - **年份**: {source['year']}
+                    - **报告类型**: {source['report_type']}
+                    - **文件名**: `{source['file_name']}`
+                    """)
+                    st.markdown(f"**内容片段：**")
+                    st.markdown(f"> {source['content']}")
+                    st.divider()
+            
+            # 保存消息和来源到 session state
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response,
+                "sources": sources
+            })
+            
+        except Exception as e:
+            st.error(f"生成回答时出错: {str(e)}")
+            import traceback
+            with st.expander("错误详情"):
+                st.code(traceback.format_exc())

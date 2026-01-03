@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境变量（防止隐私泄露）
+.env
+.env.local
+
+# 数据文件
+data/raw/*
+!data/raw/.gitkeep
+data/vector_db/
+
+# 日志
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ==============================
+# Streamlit & Secrets (重要)
+# ==============================
+.streamlit/
+
+# ==============================
+# Vector DB storage (兜底规则)
+# ==============================
+qdrant_storage/
+storage/
+
+# ==============================
+# dotenv variants（防止手滑）
+# ==============================
+.env.*
+!.env.example

@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  financial-rag-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: financial-rag-agent
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+      - ./config:/app/config
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - financial-rag-network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - financial-rag-network
+
+networks:
+  financial-rag-network:
+    driver: bridge
+
+volumes:
+  qdrant_storage:
+
