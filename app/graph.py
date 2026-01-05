@@ -15,7 +15,7 @@ load_dotenv(dotenv_path=env_path)
 # 增加检查逻辑（不打印任何敏感信息）
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    print(f"警告：在 {env_path} 未找到有效的 API Key，请检查配置文件！")
+    print("警告：未找到有效的 API Key，请检查 .env 文件")
 else:
     print("✓ 成功加载 API Key")
 

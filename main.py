@@ -19,7 +19,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 if api_key:
     print("✓ 成功加载 API Key")
 else:
-    print(f"⚠ 警告：在 {env_path} 未找到有效的 API Key")
+    print("⚠ 警告：未找到有效的 API Key，请检查 .env 文件")
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, str(project_root))
@@ -47,6 +47,12 @@ if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
 if "document_count" not in st.session_state:
     st.session_state.document_count = 0
+if "last_query_time" not in st.session_state:
+    st.session_state.last_query_time = 0
+if "ensemble_retriever" not in st.session_state:
+    st.session_state.ensemble_retriever = None
+if "reranker" not in st.session_state:
+    st.session_state.reranker = None
 
 
 @st.cache_resource
@@ -83,8 +89,7 @@ def initialize_vector_store():
         return vector_store, document_count
     except Exception as e:
         st.error(f"初始化向量数据库失败: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
+        # 不显示详细堆栈跟踪，避免泄露敏感信息
         return None, 0
 
 
@@ -99,42 +104,150 @@ def get_document_count():
         return 19085  # 默认值
 
 
-def retrieve_documents(query: str, vector_store, k: int = 5):
+@st.cache_resource
+def initialize_ensemble_retriever(vector_store):
     """
-    从向量数据库检索相关文档
+    初始化混合检索器（向量检索 + BM25）
+    
+    Args:
+        vector_store: 向量存储对象
+        
+    Returns:
+        EnsembleRetriever 对象
+    """
+    try:
+        from langchain.retrievers import EnsembleRetriever
+        from langchain_community.retrievers import BM25Retriever
+        
+        # 获取所有文档用于 BM25（分批获取以提高效率）
+        all_docs = []
+        try:
+            # 尝试获取所有文档，如果文档太多则分批处理
+            batch_size = 1000
+            for i in range(0, 20000, batch_size):  # 最多获取 20000 个文档
+                batch = vector_store.similarity_search("", k=batch_size)
+                if not batch:
+                    break
+                all_docs.extend(batch)
+                if len(batch) < batch_size:
+                    break
+        except Exception as e:
+            # 如果获取失败，使用较小的样本
+            all_docs = vector_store.similarity_search("", k=5000)
+        
+        if not all_docs:
+            return None
+        
+        # 初始化 BM25 检索器
+        bm25_retriever = BM25Retriever.from_documents(all_docs)
+        bm25_retriever.k = 20  # BM25 召回数量
+        
+        # 向量检索器
+        vector_retriever = vector_store.as_retriever(search_kwargs={"k": 20})
+        
+        # 混合检索器（权重各占 0.5）
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[vector_retriever, bm25_retriever],
+            weights=[0.5, 0.5]
+        )
+        
+        return ensemble_retriever
+    except Exception as e:
+        st.warning(f"初始化混合检索器失败，将使用纯向量检索: {str(e)}")
+        # 不显示详细堆栈跟踪，避免泄露敏感信息
+        return None
+
+
+@st.cache_resource
+def initialize_reranker():
+    """
+    初始化重排序模型
+    
+    Returns:
+        FlashrankRerank 对象
+    """
+    try:
+        from langchain_community.cross_encoders import FlashrankRerank
+        
+        reranker = FlashrankRerank(model="ms-marco-MiniLM-L-12-v2")
+        return reranker
+    except Exception as e:
+        st.warning(f"初始化重排序模型失败: {str(e)}")
+        return None
+
+
+def retrieve_documents(query: str, vector_store, ensemble_retriever, reranker, k: int = 5):
+    """
+    从向量数据库检索相关文档（支持混合检索和重排序）
     
     Args:
         query: 查询文本
         vector_store: 向量存储对象
-        k: 返回的文档数量
+        ensemble_retriever: 混合检索器
+        reranker: 重排序模型
+        k: 最终返回的文档数量
         
     Returns:
-        检索到的文档列表
+        检索到的文档列表（带分数）
     """
     try:
-        # 使用 LangChain 的 similarity_search_with_score 方法
-        # 这个方法会自动使用传入的 embeddings 模型进行查询向量化
         if vector_store is None:
             return []
         
-        docs = vector_store.similarity_search_with_score(query, k=k)
-        return docs
-    except AttributeError as e:
-        # 如果 similarity_search_with_score 不可用，尝试使用 similarity_search
-        try:
-            docs = vector_store.similarity_search(query, k=k)
-            # 如果没有分数，返回默认分数 0.0
-            docs_with_score = [(doc, 0.0) for doc in docs]
-            return docs_with_score
-        except Exception as e2:
-            st.error(f"检索文档失败: {str(e2)}")
-            import traceback
-            st.code(traceback.format_exc())
+        # 第一步：混合检索召回 20 个候选文档
+        if ensemble_retriever:
+            # 使用混合检索
+            candidate_docs = ensemble_retriever.get_relevant_documents(query)
+        else:
+            # 降级到纯向量检索
+            candidate_docs = vector_store.similarity_search(query, k=20)
+        
+        if not candidate_docs:
             return []
+        
+        # 第二步：重排序，精选出 top k 个文档
+        if reranker and len(candidate_docs) > k:
+            try:
+                # FlashrankRerank 可能使用不同的 API，尝试多种方法
+                if hasattr(reranker, 'compress_documents'):
+                    reranked_docs = reranker.compress_documents(
+                        documents=candidate_docs,
+                        query=query
+                    )
+                elif hasattr(reranker, 'rerank'):
+                    # 尝试 rerank 方法
+                    reranked_docs = reranker.rerank(query, candidate_docs)
+                elif hasattr(reranker, 'score'):
+                    # 使用 score 方法进行重排序
+                    scored_docs = []
+                    for doc in candidate_docs:
+                        score = reranker.score(query, doc.page_content)
+                        scored_docs.append((doc, score))
+                    # 按分数排序
+                    scored_docs.sort(key=lambda x: x[1], reverse=True)
+                    reranked_docs = [doc for doc, _ in scored_docs]
+                else:
+                    # 如果都不支持，使用原始文档
+                    reranked_docs = candidate_docs
+                
+                final_docs = reranked_docs[:k] if isinstance(reranked_docs, list) else list(reranked_docs)[:k]
+            except Exception as e:
+                # 如果重排序失败，使用原始文档
+                final_docs = candidate_docs[:k]
+        else:
+            final_docs = candidate_docs[:k]
+        
+        # 转换为带分数的格式（重排序后的文档没有分数，使用索引作为排序依据）
+        docs_with_score = []
+        for idx, doc in enumerate(final_docs):
+            # 使用 (1.0 - idx/len(final_docs)) 作为相似度分数（排序越靠前分数越高）
+            score = 1.0 - (idx / len(final_docs))
+            docs_with_score.append((doc, score))
+        
+        return docs_with_score
     except Exception as e:
         st.error(f"检索文档失败: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
+        # 不显示详细堆栈跟踪，避免泄露敏感信息
         return []
 
 
@@ -304,6 +417,20 @@ if st.session_state.vector_store is None:
         st.session_state.document_count = doc_count
     st.rerun()
 
+# 初始化混合检索器和重排序模型
+if st.session_state.vector_store and st.session_state.ensemble_retriever is None:
+    with st.spinner("正在初始化混合检索器..."):
+        try:
+            st.session_state.ensemble_retriever = initialize_ensemble_retriever(st.session_state.vector_store)
+        except Exception as e:
+            st.session_state.ensemble_retriever = None
+
+if st.session_state.reranker is None:
+    try:
+        st.session_state.reranker = initialize_reranker()
+    except Exception as e:
+        st.session_state.reranker = None
+
 # 显示对话历史
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -326,6 +453,18 @@ for message in st.session_state.messages:
 
 # 用户输入（确保在主循环中，页面加载时就渲染）
 if prompt := st.chat_input("请输入您的问题..."):
+    # 1. 访问频率限制检查
+    import time
+    current_time = time.time()
+    time_since_last_query = current_time - st.session_state.last_query_time
+    
+    if time_since_last_query < 3:
+        st.warning("提问太快啦，请稍等")
+        st.stop()
+    
+    # 更新最后查询时间
+    st.session_state.last_query_time = current_time
+    
     # 添加用户消息
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -336,9 +475,15 @@ if prompt := st.chat_input("请输入您的问题..."):
         st.error("向量数据库未初始化，请检查数据文件")
         st.stop()
     
-    # 检索相关文档
+    # 检索相关文档（使用混合检索和重排序）
     with st.spinner("正在检索相关文档..."):
-        docs = retrieve_documents(prompt, st.session_state.vector_store, k=5)
+        docs = retrieve_documents(
+            prompt, 
+            st.session_state.vector_store,
+            st.session_state.ensemble_retriever,
+            st.session_state.reranker,
+            k=5
+        )
         
         if not docs:
             st.warning("未找到相关文档，请尝试其他问题")
@@ -391,6 +536,4 @@ if prompt := st.chat_input("请输入您的问题..."):
             
         except Exception as e:
             st.error(f"生成回答时出错: {str(e)}")
-            import traceback
-            with st.expander("错误详情"):
-                st.code(traceback.format_exc())
+            # 不显示详细堆栈跟踪，避免泄露敏感信息（如 API Key、文件路径等）

@@ -39,7 +39,7 @@ class PDFProcessor:
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
         """
-        从 PDF 文件中提取文本和表格
+        从 PDF 文件中提取文本和表格（优化版，支持复杂表格和多模态准备）
         
         Args:
             pdf_path: PDF 文件路径
@@ -57,11 +57,37 @@ class PDFProcessor:
                     if text:
                         content_parts.append(f"## 第 {page_num} 页\n\n{text}\n")
                     
-                    # 提取表格
-                    tables = page.extract_tables()
+                    # 优化表格提取：使用精细化配置
+                    # 针对财务表格的特殊处理
+                    table_settings = {
+                        "vertical_strategy": "lines_strict",  # 严格按线条提取
+                        "horizontal_strategy": "lines_strict",
+                        "explicit_vertical_lines": page.curves + page.lines,  # 使用所有线条
+                        "explicit_horizontal_lines": page.curves + page.lines,
+                        "snap_tolerance": 3,  # 容差设置
+                        "join_tolerance": 3,
+                        "edge_tolerance": 3,
+                        "min_words_vertical": 1,  # 最小单元格字数
+                        "min_words_horizontal": 1,
+                    }
+                    
+                    # 尝试提取表格
+                    tables = page.extract_tables(table_settings=table_settings)
+                    
+                    # 如果没有提取到表格，尝试更宽松的策略
+                    if not tables:
+                        table_settings_relaxed = {
+                            "vertical_strategy": "text",
+                            "horizontal_strategy": "text",
+                            "snap_tolerance": 5,
+                            "join_tolerance": 5,
+                        }
+                        tables = page.extract_tables(table_settings=table_settings_relaxed)
+                    
                     if tables:
                         for table_num, table in enumerate(tables, start=1):
-                            markdown_table = self._table_to_markdown(table)
+                            # 使用优化的表格转换
+                            markdown_table = self._table_to_markdown_enhanced(table)
                             if markdown_table:
                                 content_parts.append(
                                     f"### 第 {page_num} 页 - 表格 {table_num}\n\n{markdown_table}\n\n"
@@ -71,6 +97,85 @@ class PDFProcessor:
             raise Exception(f"提取 PDF 内容时出错: {str(e)}")
         
         return "\n".join(content_parts)
+    
+    def _table_to_markdown_enhanced(self, table: List[List]) -> str:
+        """
+        增强版表格转 Markdown（支持复杂网格数据和多模态准备）
+        
+        Args:
+            table: 表格数据（二维列表）
+            
+        Returns:
+            Markdown 格式的表格字符串（标准格式，便于 AI 读取）
+        """
+        if not table or len(table) == 0:
+            return ""
+        
+        # 清理和规范化表格数据
+        cleaned_table = []
+        for row in table:
+            cleaned_row = []
+            for cell in row:
+                if cell is None:
+                    cleaned_row.append("")
+                else:
+                    # 转换为字符串并清理
+                    cell_str = str(cell).strip()
+                    # 保留财务数据格式（数字、千位分隔符等）
+                    # 移除多余的空白字符，但保留必要的空格
+                    cell_str = " ".join(cell_str.split())
+                    cleaned_row.append(cell_str)
+            cleaned_table.append(cleaned_row)
+        
+        if len(cleaned_table) == 0:
+            return ""
+        
+        # 确定列数（取最大行长度）
+        max_cols = max(len(row) for row in cleaned_table) if cleaned_table else 0
+        if max_cols == 0:
+            return ""
+        
+        # 统一所有行的列数
+        for row in cleaned_table:
+            while len(row) < max_cols:
+                row.append("")
+        
+        # 计算每列的最大宽度（用于对齐）
+        col_widths = [0] * max_cols
+        for row in cleaned_table:
+            for col_idx, cell in enumerate(row):
+                # 计算显示宽度（中文字符算2个宽度）
+                width = self._get_display_width(str(cell))
+                col_widths[col_idx] = max(col_widths[col_idx], width)
+        
+        # 生成标准 Markdown 表格（便于 AI 解析）
+        markdown_lines = []
+        
+        # 表头
+        if len(cleaned_table) > 0:
+            header = cleaned_table[0]
+            header_row = "| " + " | ".join(
+                self._pad_cell(str(cell), col_widths[i]) 
+                for i, cell in enumerate(header)
+            ) + " |"
+            markdown_lines.append(header_row)
+            
+            # 分隔行（标准 Markdown 格式）
+            separator = "| " + " | ".join(
+                "-" * max(3, col_widths[i])  # 至少3个字符
+                for i in range(max_cols)
+            ) + " |"
+            markdown_lines.append(separator)
+            
+            # 数据行
+            for row in cleaned_table[1:]:
+                data_row = "| " + " | ".join(
+                    self._pad_cell(str(cell), col_widths[i]) 
+                    for i, cell in enumerate(row)
+                ) + " |"
+                markdown_lines.append(data_row)
+        
+        return "\n".join(markdown_lines)
     
     def _table_to_markdown(self, table: List[List]) -> str:
         """

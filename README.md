@@ -1,5 +1,8 @@
 # FinGPT-RAG: 基于 DeepSeek 的万级金融财报智能分析助手
 
+> 🔗 **GitHub Repository**  
+> https://github.com/Yuliu11/FinGPT-RAG
+
 ## 🌟 项目简介
 
 本项目是一款专为金融从业者设计的 RAG (Retrieval-Augmented Generation) 助手。通过集成 DeepSeek 大模型与 Qdrant 高性能向量数据库，实现了对海量上市公司财报的精准检索与深度分析。项目核心处理了 20 份核心财报，生成了超过 19,000 个高质量知识块。
@@ -128,3 +131,7 @@ MIT License
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
+
+## 📎 项目链接
+
+- GitHub 仓库：https://github.com/Yuliu11/FinGPT-RAG
