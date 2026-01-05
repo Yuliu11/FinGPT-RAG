@@ -161,18 +161,22 @@ def initialize_ensemble_retriever(vector_store):
 @st.cache_resource
 def initialize_reranker():
     """
-    初始化重排序模型
+    初始化重排序模型（直接使用 flashrank 库）
     
     Returns:
-        FlashrankRerank 对象
+        Ranker 对象，如果加载失败则返回 None
     """
     try:
-        from langchain_community.cross_encoders import FlashrankRerank
+        from flashrank import Ranker
         
-        reranker = FlashrankRerank(model="ms-marco-MiniLM-L-12-v2")
+        # 使用轻量级模型进行重排序
+        reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=None)
         return reranker
+    except ImportError:
+        print("警告：无法导入 flashrank，将不使用重排序功能")
+        return None
     except Exception as e:
-        st.warning(f"初始化重排序模型失败: {str(e)}")
+        print(f"警告：初始化重排序模型失败: {str(e)}，将不使用重排序功能")
         return None
 
 
@@ -205,34 +209,47 @@ def retrieve_documents(query: str, vector_store, ensemble_retriever, reranker, k
         if not candidate_docs:
             return []
         
-        # 第二步：重排序，精选出 top k 个文档
+        # 第二步：使用 flashrank 进行重排序，精选出 top k 个文档
         if reranker and len(candidate_docs) > k:
             try:
-                # FlashrankRerank 可能使用不同的 API，尝试多种方法
-                if hasattr(reranker, 'compress_documents'):
-                    reranked_docs = reranker.compress_documents(
-                        documents=candidate_docs,
-                        query=query
-                    )
-                elif hasattr(reranker, 'rerank'):
-                    # 尝试 rerank 方法
-                    reranked_docs = reranker.rerank(query, candidate_docs)
-                elif hasattr(reranker, 'score'):
-                    # 使用 score 方法进行重排序
-                    scored_docs = []
-                    for doc in candidate_docs:
-                        score = reranker.score(query, doc.page_content)
-                        scored_docs.append((doc, score))
-                    # 按分数排序
-                    scored_docs.sort(key=lambda x: x[1], reverse=True)
-                    reranked_docs = [doc for doc, _ in scored_docs]
-                else:
-                    # 如果都不支持，使用原始文档
-                    reranked_docs = candidate_docs
+                # 将 LangChain Document 对象转换为 flashrank 需要的格式
+                # flashrank 需要 passages 是一个包含 "id" 和 "text" 的字典列表
+                passages = []
+                for i, doc in enumerate(candidate_docs):
+                    passages.append({
+                        "id": str(i),
+                        "text": doc.page_content
+                    })
                 
-                final_docs = reranked_docs[:k] if isinstance(reranked_docs, list) else list(reranked_docs)[:k]
+                # 使用 Ranker 进行重排序
+                # flashrank 的 rerank 方法接受 query 和 passages 参数
+                rerank_results = reranker.rerank(query=query, passages=passages, top_n=k)
+                
+                # rerank_results 是一个列表，每个元素包含 id 和 score
+                # 已经按 score 从高到低排序
+                
+                # 创建 id 到文档的映射
+                doc_map = {str(i): doc for i, doc in enumerate(candidate_docs)}
+                
+                # 根据重排序结果选择 top k 个文档
+                final_docs = []
+                for result in rerank_results:
+                    doc_id = result.get('id')
+                    if doc_id in doc_map:
+                        final_docs.append(doc_map[doc_id])
+                    if len(final_docs) >= k:
+                        break
+                
+                # 如果重排序结果不足 k 个，用原始文档补充（通常不会发生）
+                if len(final_docs) < k:
+                    selected_ids = {result.get('id') for result in rerank_results}
+                    for i, doc in enumerate(candidate_docs):
+                        if str(i) not in selected_ids and len(final_docs) < k:
+                            final_docs.append(doc)
+                
             except Exception as e:
-                # 如果重排序失败，使用原始文档
+                # 如果重排序失败，使用原始文档（降级处理）
+                print(f"警告：重排序失败: {str(e)}，将使用原始检索结果")
                 final_docs = candidate_docs[:k]
         else:
             final_docs = candidate_docs[:k]

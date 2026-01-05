@@ -52,45 +52,66 @@ class PDFProcessor:
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, start=1):
-                    # 提取文本
-                    text = page.extract_text()
-                    if text:
-                        content_parts.append(f"## 第 {page_num} 页\n\n{text}\n")
+                    try:
+                        # 提取文本
+                        text = page.extract_text()
+                        if text:
+                            content_parts.append(f"## 第 {page_num} 页\n\n{text}\n")
+                    except Exception as e:
+                        # 文本提取失败，记录但继续处理
+                        content_parts.append(f"## 第 {page_num} 页\n\n[文本提取失败: {str(e)}]\n")
                     
-                    # 优化表格提取：使用精细化配置
+                    # 优化表格提取：使用兼容的配置参数
                     # 针对财务表格的特殊处理
-                    table_settings = {
-                        "vertical_strategy": "lines_strict",  # 严格按线条提取
-                        "horizontal_strategy": "lines_strict",
-                        "explicit_vertical_lines": page.curves + page.lines,  # 使用所有线条
-                        "explicit_horizontal_lines": page.curves + page.lines,
-                        "snap_tolerance": 3,  # 容差设置
-                        "join_tolerance": 3,
-                        "edge_tolerance": 3,
-                        "min_words_vertical": 1,  # 最小单元格字数
-                        "min_words_horizontal": 1,
-                    }
+                    tables = []
                     
-                    # 尝试提取表格
-                    tables = page.extract_tables(table_settings=table_settings)
-                    
-                    # 如果没有提取到表格，尝试更宽松的策略
-                    if not tables:
-                        table_settings_relaxed = {
-                            "vertical_strategy": "text",
-                            "horizontal_strategy": "text",
-                            "snap_tolerance": 5,
-                            "join_tolerance": 5,
+                    # 策略1：尝试使用线条策略（适合有明确表格线的PDF）
+                    try:
+                        table_settings_strict = {
+                            "vertical_strategy": "lines_strict",
+                            "horizontal_strategy": "lines_strict",
+                            "snap_tolerance": 3,
+                            "join_tolerance": 3,
+                            "min_words_vertical": 1,
+                            "min_words_horizontal": 1,
                         }
-                        tables = page.extract_tables(table_settings=table_settings_relaxed)
+                        tables = page.extract_tables(table_settings=table_settings_strict)
+                    except Exception as e:
+                        # 如果严格策略失败，尝试默认策略
+                        pass
                     
+                    # 策略2：如果没有提取到表格，尝试更宽松的文本策略
+                    if not tables:
+                        try:
+                            table_settings_relaxed = {
+                                "vertical_strategy": "text",
+                                "horizontal_strategy": "text",
+                                "snap_tolerance": 5,
+                                "join_tolerance": 5,
+                            }
+                            tables = page.extract_tables(table_settings=table_settings_relaxed)
+                        except Exception as e:
+                            # 文本策略也失败，尝试默认提取
+                            try:
+                                tables = page.extract_tables()
+                            except Exception as e:
+                                # 默认提取也失败，跳过表格
+                                tables = []
+                    
+                    # 处理提取到的表格
                     if tables:
                         for table_num, table in enumerate(tables, start=1):
-                            # 使用优化的表格转换
-                            markdown_table = self._table_to_markdown_enhanced(table)
-                            if markdown_table:
+                            try:
+                                # 使用优化的表格转换
+                                markdown_table = self._table_to_markdown_enhanced(table)
+                                if markdown_table:
+                                    content_parts.append(
+                                        f"### 第 {page_num} 页 - 表格 {table_num}\n\n{markdown_table}\n\n"
+                                    )
+                            except Exception as e:
+                                # 单个表格转换失败，记录但继续处理其他表格
                                 content_parts.append(
-                                    f"### 第 {page_num} 页 - 表格 {table_num}\n\n{markdown_table}\n\n"
+                                    f"### 第 {page_num} 页 - 表格 {table_num}\n\n[表格转换失败: {str(e)}]\n\n"
                                 )
         
         except Exception as e:
