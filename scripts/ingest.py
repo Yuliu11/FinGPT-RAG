@@ -7,10 +7,20 @@ import os
 import sys
 import re
 import logging
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 from tqdm import tqdm
 from dotenv import load_dotenv
+
+# 导入 torch 用于 GPU 检测
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
 
 # 自动寻找当前文件所在目录的父目录下的 .env
 env_path = Path(__file__).parent.parent / '.env'
@@ -29,7 +39,7 @@ sys.path.insert(0, str(project_root))
 
 from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
 
 # 兼容不同版本的 langchain
 try:
@@ -52,6 +62,35 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# 检测计算设备（GPU/CPU）
+def get_device():
+    """
+    自动检测可用的计算设备
+    
+    Returns:
+        str: 'cuda' 或 'cpu'
+    """
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        device = "cuda"
+        device_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "CUDA"
+        logger.info(f"🚀 当前计算设备: CUDA ({device_name})")
+        print(f"🚀 当前计算设备: CUDA ({device_name})")
+    else:
+        device = "cpu"
+        if not TORCH_AVAILABLE:
+            logger.warning("PyTorch 未安装，使用 CPU 模式")
+            print("⚠️  PyTorch 未安装，使用 CPU 模式")
+        elif not torch.cuda.is_available():
+            logger.info("🚀 当前计算设备: CPU (CUDA 不可用)")
+            print("🚀 当前计算设备: CPU (CUDA 不可用)")
+        else:
+            logger.info("🚀 当前计算设备: CPU")
+            print("🚀 当前计算设备: CPU")
+    return device
+
+# 在程序启动时检测设备
+DEVICE = get_device()
 
 
 class DataIngester:
@@ -86,6 +125,9 @@ class DataIngester:
         # 初始化嵌入模型
         self.embeddings = self._initialize_embeddings()
         
+        # 初始化 Qdrant 客户端（用于查询元数据）
+        self.client = None
+        
         # 确保向量数据库目录存在
         self.vector_db_path.mkdir(parents=True, exist_ok=True)
     
@@ -93,6 +135,7 @@ class DataIngester:
         """
         初始化嵌入模型
         直接使用本地 HuggingFaceEmbeddings 模型（不消耗 API 额度）
+        支持 GPU 加速（如果可用）
         
         Returns:
             嵌入模型对象
@@ -113,10 +156,12 @@ class DataIngester:
                     from langchain.embeddings import HuggingFaceEmbeddings
                     logger.info("使用 langchain.embeddings")
             
-            logger.info("加载模型: shibing624/text2vec-base-chinese")
+            # 使用全局检测到的设备
+            device = DEVICE
+            logger.info(f"加载模型: shibing624/text2vec-base-chinese (设备: {device})")
             embeddings = HuggingFaceEmbeddings(
                 model_name='shibing624/text2vec-base-chinese',
-                model_kwargs={'device': 'cpu'},
+                model_kwargs={'device': device},
                 encode_kwargs={'normalize_embeddings': True}
             )
             
@@ -124,11 +169,25 @@ class DataIngester:
             logger.info("测试嵌入模型...")
             test_text = "测试"
             _ = embeddings.embed_query(test_text)
-            logger.info("✓ 成功初始化 HuggingFaceEmbeddings（本地模型，不消耗 API 额度）")
+            logger.info(f"✓ 成功初始化 HuggingFaceEmbeddings（本地模型，设备: {device}，不消耗 API 额度）")
             
             return embeddings
         except Exception as e:
             logger.error(f"初始化 HuggingFaceEmbeddings 失败: {str(e)}")
+            # 如果 GPU 初始化失败，尝试降级到 CPU
+            if DEVICE == "cuda":
+                logger.warning("GPU 初始化失败，尝试降级到 CPU...")
+                try:
+                    embeddings = HuggingFaceEmbeddings(
+                        model_name='shibing624/text2vec-base-chinese',
+                        model_kwargs={'device': 'cpu'},
+                        encode_kwargs={'normalize_embeddings': True}
+                    )
+                    _ = embeddings.embed_query("测试")
+                    logger.info("✓ 成功降级到 CPU 模式")
+                    return embeddings
+                except Exception as e2:
+                    logger.error(f"CPU 降级也失败: {str(e2)}")
             raise Exception(f"无法初始化嵌入模型: {str(e)}")
     
     def extract_metadata_from_path(self, file_path: Path) -> Dict[str, str]:
@@ -239,18 +298,85 @@ class DataIngester:
         logger.info(f"找到 {len(pdf_files)} 个 PDF 文件")
         return sorted(pdf_files)
     
-    def process_file(self, pdf_path: Path) -> List[Document]:
+    def check_file_exists(self, file_hash: str) -> bool:
         """
-        处理单个 PDF 文件
+        检查 Qdrant 中是否已存在具有相同 file_hash 的记录
+        
+        Args:
+            file_hash: 文件的 MD5 哈希值
+            
+        Returns:
+            如果存在返回 True，否则返回 False
+        """
+        if self.client is None:
+            return False
+        
+        try:
+            # 使用 Qdrant 的 scroll 方法配合过滤器查询
+            scroll_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="file_hash",
+                        match=MatchValue(value=file_hash)
+                    )
+                ]
+            )
+            
+            # 只查询一条记录即可判断是否存在
+            results, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=scroll_filter,
+                limit=1
+            )
+            
+            return len(results) > 0
+        except Exception as e:
+            # 如果查询失败（可能是集合不存在或字段不存在），返回 False
+            logger.debug(f"查询文件哈希时出错（可能集合为空）: {str(e)}")
+            return False
+    
+    def generate_deterministic_id(self, file_name: str, chunk_index: int):
+        """
+        生成确定性 UUID（基于文件名和分块序号）
+        确保同一个块多次写入时使用相同的 ID，实现 upsert
+        
+        Args:
+            file_name: 文件名
+            chunk_index: 分块序号
+            
+        Returns:
+            UUID 对象（Qdrant 支持 UUID 对象作为 ID）
+        """
+        # 使用文件名和分块序号生成确定性 UUID
+        namespace = uuid.NAMESPACE_DNS
+        unique_string = f"{file_name}_{chunk_index}"
+        deterministic_uuid = uuid.uuid5(namespace, unique_string)
+        return deterministic_uuid
+    
+    def process_file(self, pdf_path: Path, vector_store: Optional[Qdrant] = None) -> List[Document]:
+        """
+        处理单个 PDF 文件（支持增量入库和去重）
         
         Args:
             pdf_path: PDF 文件路径
+            vector_store: 向量存储对象（用于检查文件是否已存在）
             
         Returns:
-            Document 对象列表
+            Document 对象列表（如果文件已存在则返回空列表）
         """
         try:
-            logger.info(f"正在处理: {pdf_path}")
+            logger.info(f"正在检查: {pdf_path.name}")
+            
+            # 计算文件哈希值（指纹）
+            file_hash = self.pdf_processor.calculate_file_hash(str(pdf_path))
+            logger.debug(f"文件哈希: {file_hash[:8]}...")
+            
+            # 检查文件是否已存在
+            if self.check_file_exists(file_hash):
+                logger.info(f"[SKIP] 文件 {pdf_path.name} 已存在，跳过处理")
+                return []
+            
+            logger.info(f"[NEW] 处理新文件: {pdf_path.name}")
             
             # 提取元数据
             metadata = self.extract_metadata_from_path(pdf_path)
@@ -258,15 +384,25 @@ class DataIngester:
             # 处理 PDF
             chunks = self.pdf_processor.process_pdf(str(pdf_path))
             
-            # 转换为 Document 对象
+            # 获取当前时间戳
+            processed_at = datetime.now().isoformat()
+            
+            # 转换为 Document 对象，增加元数据字段
             documents = []
             for idx, chunk in enumerate(chunks):
+                # 生成确定性 ID
+                doc_id = self.generate_deterministic_id(pdf_path.name, idx)
+                
                 doc = Document(
                     page_content=chunk["text"],
                     metadata={
                         **metadata,
+                        "file_hash": file_hash,
+                        "processed_at": processed_at,
+                        "source_file": pdf_path.name,
                         "chunk_index": idx,
-                        "total_chunks": len(chunks)
+                        "total_chunks": len(chunks),
+                        "doc_id": str(doc_id)  # 存储为字符串，使用时转换为 UUID
                     }
                 )
                 documents.append(doc)
@@ -288,6 +424,9 @@ class DataIngester:
         try:
             # 使用本地 Qdrant 客户端
             client = QdrantClient(path=str(self.vector_db_path))
+            
+            # 保存客户端引用，用于后续查询
+            self.client = client
             
             # 检查集合是否存在
             collections = client.get_collections().collections
@@ -359,21 +498,47 @@ class DataIngester:
         
         vector_store = self.initialize_vector_store()
         
-        # 处理所有文件
+        # 处理所有文件（增量入库）
         all_documents = []
+        skipped_files = 0
+        new_files = 0
         
-        with tqdm(total=len(pdf_files), desc="处理 PDF 文件", unit="文件") as pbar:
+        with tqdm(total=len(pdf_files), desc="检查 PDF 文件", unit="文件") as pbar:
             for pdf_path in pdf_files:
-                documents = self.process_file(pdf_path)
-                all_documents.extend(documents)
+                documents = self.process_file(pdf_path, vector_store)
+                if len(documents) == 0:
+                    skipped_files += 1
+                else:
+                    new_files += 1
+                    all_documents.extend(documents)
                 pbar.update(1)
         
+        # 统计信息
+        logger.info("=" * 60)
+        logger.info("文件检查完成")
+        logger.info(f"  新增文件: {new_files} 个")
+        logger.info(f"  跳过文件: {skipped_files} 个（已存在）")
+        logger.info(f"  总计文件: {len(pdf_files)} 个")
+        logger.info("=" * 60)
+        
         if len(all_documents) == 0:
-            logger.warning("没有生成任何文档块")
+            logger.warning("没有需要入库的新文档块")
+            logger.info("=" * 60)
+            logger.info("数据导入完成！")
+            logger.info(f"总计处理: {len(pdf_files)} 个文件")
+            logger.info(f"新增文件: {new_files} 个")
+            logger.info(f"跳过文件: {skipped_files} 个")
+            logger.info(f"新增文档块: 0 个")
+            logger.info(f"向量数据库路径: {self.vector_db_path}")
+            logger.info(f"集合名称: {self.collection_name}")
+            logger.info("=" * 60)
             return
         
-        # 批量添加到向量数据库
-        logger.info(f"正在将 {len(all_documents)} 个文档块添加到向量数据库...")
+        # 批量添加到向量数据库（使用 upsert 模式）
+        logger.info(f"正在将 {len(all_documents)} 个文档块添加到向量数据库（使用 upsert 模式）...")
+        
+        # 使用 QdrantClient 直接实现 upsert（支持确定性 ID）
+        from qdrant_client.models import PointStruct
         
         with tqdm(total=len(all_documents), desc="导入向量数据库", unit="块") as pbar:
             # 分批处理，避免内存问题
@@ -381,19 +546,85 @@ class DataIngester:
             for i in range(0, len(all_documents), batch_size):
                 batch = all_documents[i:i + batch_size]
                 try:
-                    vector_store.add_documents(batch)
+                    # 准备 upsert 的点
+                    points = []
+                    for doc in batch:
+                        # 生成向量嵌入
+                        embedding = self.embeddings.embed_query(doc.page_content)
+                        
+                        # 获取确定性 ID
+                        doc_id = doc.metadata.get("doc_id")
+                        if not doc_id:
+                            # 如果没有 doc_id，使用文件名和分块序号生成
+                            file_name = doc.metadata.get("source_file", "unknown")
+                            chunk_index = doc.metadata.get("chunk_index", 0)
+                            doc_id = self.generate_deterministic_id(file_name, chunk_index)
+                        else:
+                            # 如果 doc_id 是字符串，转换为 UUID 对象
+                            if isinstance(doc_id, str):
+                                try:
+                                    doc_id = uuid.UUID(doc_id)
+                                except ValueError:
+                                    # 如果无法解析为 UUID，重新生成
+                                    file_name = doc.metadata.get("source_file", "unknown")
+                                    chunk_index = doc.metadata.get("chunk_index", 0)
+                                    doc_id = self.generate_deterministic_id(file_name, chunk_index)
+                        
+                        # 将元数据转换为 Qdrant 格式（所有值必须是基本类型）
+                        # 注意：doc_id 不作为 payload，而是作为 PointStruct 的 id
+                        payload = {}
+                        for key, value in doc.metadata.items():
+                            # 跳过 doc_id，因为它已经作为 PointStruct 的 id
+                            if key == "doc_id":
+                                continue
+                            # Qdrant 只支持基本类型（str, int, float, bool, list, dict）
+                            if isinstance(value, (str, int, float, bool)):
+                                payload[key] = value
+                            elif value is None:
+                                payload[key] = None
+                            else:
+                                # 其他类型转换为字符串
+                                payload[key] = str(value)
+                        
+                        # 创建 PointStruct
+                        point = PointStruct(
+                            id=doc_id,
+                            vector=embedding,
+                            payload=payload
+                        )
+                        points.append(point)
+                    
+                    # 使用 upsert 方法（如果 ID 已存在则更新，否则插入）
+                    self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=points
+                    )
                     pbar.update(len(batch))
                 except Exception as e:
                     logger.error(f"添加文档批次时出错: {str(e)}")
-                    pbar.update(len(batch))
+                    # 如果直接 upsert 失败，尝试使用 LangChain 的 add_documents 作为后备
+                    try:
+                        logger.warning("尝试使用 LangChain 的 add_documents 作为后备方案...")
+                        vector_store.add_documents(batch)
+                        pbar.update(len(batch))
+                    except Exception as e2:
+                        logger.error(f"后备方案也失败: {str(e2)}")
+                        pbar.update(len(batch))
         
         logger.info("=" * 60)
         logger.info("数据导入完成！")
         logger.info(f"总计处理: {len(pdf_files)} 个文件")
-        logger.info(f"总计生成: {len(all_documents)} 个文档块")
+        logger.info(f"  新增文件: {new_files} 个")
+        logger.info(f"  跳过文件: {skipped_files} 个")
+        logger.info(f"新增文档块: {len(all_documents)} 个")
         logger.info(f"向量数据库路径: {self.vector_db_path}")
         logger.info(f"集合名称: {self.collection_name}")
         logger.info("=" * 60)
+        
+        # 释放 GPU 显存
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("✓ 已释放 GPU 显存")
 
 
 def main():

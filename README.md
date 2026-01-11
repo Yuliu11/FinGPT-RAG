@@ -1,23 +1,41 @@
+![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![LangChain](https://img.shields.io/badge/Framework-LangChain-green.svg)
+![DeepSeek](https://img.shields.io/badge/LLM-DeepSeek-red.svg)
+![Qdrant](https://img.shields.io/badge/VectorDB-Qdrant-orange.svg)
 # FinGPT-RAG: 基于 DeepSeek 的万级金融财报智能分析助手
 
 > 🔗 **GitHub Repository**  
 > https://github.com/Yuliu11/FinGPT-RAG
 
+
 ## 🌟 项目简介
 
-本项目是一款专为金融从业者设计的 RAG (Retrieval-Augmented Generation) 助手。通过集成 DeepSeek 大模型与 Qdrant 高性能向量数据库，实现了对海量上市公司财报的精准检索与深度分析。项目核心处理了 20 份核心财报，生成了超过 19,000 个高质量知识块。
+本项目是一款专为金融从业者设计的 RAG (Retrieval-Augmented Generation) 助手。通过集成 DeepSeek 大模型与 Qdrant 高性能向量数据库，实现了对海量上市公司财报的精准检索与深度分析。项目核心处理了 20 份核心财报，生成了超过 60,000 个高质量知识块。
+
+**FinGPT-RAG** 是一个专门针对 A 股上市公司财报设计的智能问答系统。它不仅能检索信息，还能像专业分析师一样思考。
+
+## 🌟 核心进化 (Agentic RAG)
+不同于传统的线性 RAG，本项目引入了 **LangGraph** 驱动的智能体逻辑：
+- **自动化语义扩写**：自动将“风险”、“赚钱能力”等口语转化为“可能面对的风险”、“净利润/毛利率”等财报专业术语，极大提升检索精度。
+- **多路检索与逻辑评分**：Agent 会评估搜索结果质量，若信息不足将自动触发“查询重写”逻辑，拒绝幻觉。
+- **精准处理复杂表格**：针对 PDF 财报中的非结构化数据，通过正则清洗与 Markdown 转换，实现财务数值的精准提取。
 
 ## 🚀 技术架构
 
-- **数据层**：利用 LangChain 递归字符分块算法，针对金融报表进行了语义边界优化。
-- **检索层**：Qdrant 本地化向量存储，支持万级数据秒级召回。
-- **推理层**：通过 OpenAI-compatible API 调用 DeepSeek 模型，支持流式输出与异步封装，具备较强的财务语义理解与逻辑推演能力。
+- **数据层**：采用递归字符分块，针对金融报表进行语义边界优化，并结合 正则表达式（Regex） 清洗页眉、页脚及目录噪音，强化 Markdown 表格解析。
+- **Agent 推理层**：引入 LangGraph 构建状态机，实现自动化任务拆解。
+全量查询扩写 (Query Expansion)：利用 LLM 将口语化提问实时转化为财报专业术语（如将“风险”映射为“可能面对的风险”、“经营挑战”），解决语义鸿沟。
+智能评分员 (Grader)：对检索到的文档块进行相关性评分，自动剔除无关噪音，若信息不足则自动重写 Query 重新检索。
+- **检索层**：Qdrant 本地化向量存储，支持万级数据秒级召回，通过扩写关键词实现多路并行检索。
 - **展示层**：Streamlit 构建的响应式前端，支持流式输出与信源溯源。
 
 ## ✨ 技术难点解决
 
 - **复杂表格语义对齐**：通过优化 Overlap 算法，解决了财务报表中科目与数值断裂的痛点，确保检索块具备完整财务语义。
 - **本地模型适配**：实现了 DeepSeek 原生接口的异步调用，并通过 Prompt Engineering 强化了模型在处理复杂财务对比时的准确度。
+- **金融术语对齐**：通过在检索前强制执行“语义扩写”，解决了用户提问与财报黑话不一致的痛点。
+- **复杂表格语义完整性**：优化 Overlap 算法，确保财务报表中科目与数值在分块时不被截断。
+- **减少模型幻觉**：Agent 具备“自我反思”能力，当检索到的内容无法回答问题时，系统会诚实告知缺失信息，而非编造数字。
 
 ## 🛠️ 快速开始
 

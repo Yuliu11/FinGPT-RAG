@@ -5,9 +5,18 @@ PDF 处理模块
 
 import pdfplumber
 import re
+import hashlib
 from typing import List, Dict, Optional
 from pathlib import Path
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# 导入 torch 用于 GPU 检测（为未来可能的 GPU 加速预留）
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
 
 
 class PDFProcessor:
@@ -325,6 +334,26 @@ class PDFProcessor:
         """
         chunks = self.text_splitter.split_text(text)
         return chunks
+    
+    def calculate_file_hash(self, pdf_path: str) -> str:
+        """
+        计算 PDF 文件的 MD5 哈希值（文件指纹）
+        
+        Args:
+            pdf_path: PDF 文件路径
+            
+        Returns:
+            MD5 哈希值（32位十六进制字符串）
+        """
+        hash_md5 = hashlib.md5()
+        try:
+            with open(pdf_path, "rb") as f:
+                # 分块读取，避免大文件占用过多内存
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            raise Exception(f"计算文件哈希值时出错: {str(e)}")
     
     def process_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
         """
